@@ -8,22 +8,13 @@ import com.alibaba.otter.canal.client.adapter.support.EtlResult;
 import com.alibaba.otter.canal.client.adapter.support.ExtensionLoader;
 import com.alibaba.otter.canal.client.adapter.support.FileName2KeyMapping;
 import com.alibaba.otter.canal.client.adapter.support.Result;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import javax.annotation.PostConstruct;
-import javax.annotation.Resource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.web.bind.annotation.GetMapping;
-import org.springframework.web.bind.annotation.PathVariable;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.PutMapping;
-import org.springframework.web.bind.annotation.RequestParam;
-import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.*;
+
+import javax.annotation.PostConstruct;
+import javax.annotation.Resource;
+import java.util.*;
 
 /**
  * 适配器操作Rest
@@ -34,31 +25,32 @@ import org.springframework.web.bind.annotation.RestController;
 @RestController
 public class CommonRest {
 
-    private static Logger                 logger           = LoggerFactory.getLogger(CommonRest.class);
+    private static Logger logger = LoggerFactory.getLogger(CommonRest.class);
 
-    private static final String           ETL_LOCK_ZK_NODE = "/sync-etl/";
+    private static final String ETL_LOCK_ZK_NODE = "/sync-etl/";
 
     private ExtensionLoader<OuterAdapter> loader;
 
     @Resource
-    private SyncSwitch                    syncSwitch;
+    private SyncSwitch syncSwitch;
     @Resource
-    private EtlLock                       etlLock;
+    private EtlLock etlLock;
 
     @Resource
-    private AdapterCanalConfig            adapterCanalConfig;
+    private AdapterCanalConfig adapterCanalConfig;
 
     @PostConstruct
     public void init() {
         loader = ExtensionLoader.getExtensionLoader(OuterAdapter.class);
     }
 
+
     /**
      * ETL curl http://127.0.0.1:8081/etl/rdb/oracle1/mytest_user.yml -X POST
      *
-     * @param type 类型 hbase, es
-     * @param key adapter key
-     * @param task 任务名对应配置文件名 mytest_user.yml
+     * @param type   类型 hbase, es
+     * @param key    adapter key
+     * @param task   任务名对应配置文件名 mytest_user.yml
      * @param params etl where条件参数, 为空全部导入
      */
     @PostMapping("/etl/{type}/{key}/{task}")
@@ -112,10 +104,81 @@ public class CommonRest {
     }
 
     /**
-     * ETL curl http://127.0.0.1:8081/etl/hbase/mytest_person2.yml -X POST
+     * ETL curl http://127.0.0.1:8081/etl/es7/mytest_person2.yml/10000/300 -X POST
      *
      * @param type 类型 hbase, es
      * @param task 任务名对应配置文件名 mytest_person2.yml
+     * @param max  id的最大值
+     * @param step 步长
+     */
+    @PostMapping("/etl/sync/{type}/{task}")
+    public EtlResult etlSync(@PathVariable String type, @PathVariable String task,
+                             @RequestParam(name = "max") int max,
+                             @RequestParam(name = "step") int step) {
+        String key = FileName2KeyMapping.getKey(type, task);
+        OuterAdapter adapter = loader.getExtension(type, key);
+        String destination = adapter.getDestination(task);
+        String lockKey = destination == null ? task : destination;
+        // 加锁
+        boolean locked = etlLock.tryLock(ETL_LOCK_ZK_NODE + type + "-" + lockKey);
+        if (!locked) {
+            EtlResult result = new EtlResult();
+            result.setSucceeded(false);
+            result.setErrorMessage(task + " 有其他进程正在导入中, 请稍后再试");
+            return result;
+        }
+        boolean oriSwitchStatus;
+        // 具体的增量和全量的锁逻辑
+        if (destination != null) {
+            oriSwitchStatus = syncSwitch.status(destination);
+            if (oriSwitchStatus) {
+                syncSwitch.off(destination);
+            }
+        } else {
+            // task可能为destination，直接锁task
+            oriSwitchStatus = syncSwitch.status(task);
+            if (oriSwitchStatus) {
+                syncSwitch.off(task);
+            }
+        }
+        try {
+            logger.info("开始清洗数据,类型为{},task的任务为{}", type, task);
+            // 循环放入id的区间
+            for (int i = 1; i < max; i += step) {
+                // 组装id 的区间 格式为  1;300000
+                String params = i + ";" + (i - 1 + step);
+                // 同步更新
+                List<String> paramArray = Arrays.asList(params.trim().split(";"));
+                adapter.etl(task, paramArray);
+                logger.info("id范围为{}的数据已清洗完成", params);
+            }
+        } finally {
+            releaseLock(destination, oriSwitchStatus, task);
+            etlLock.unlock(ETL_LOCK_ZK_NODE + type + "-" + lockKey);
+        }
+        return new EtlResult();
+    }
+
+    /**
+     * 同步任务的锁释放
+     * @param destination 实例
+     * @param oriSwitchStatus 锁状态
+     * @param task 任务
+     */
+    public void releaseLock(String destination, boolean oriSwitchStatus, String task) {
+        // 出现异常就就开启增量的锁
+        if (destination != null && oriSwitchStatus) {
+            syncSwitch.on(destination);
+        } else if (destination == null && oriSwitchStatus) {
+            syncSwitch.on(task);
+        }
+    }
+
+    /**
+     * ETL curl http://127.0.0.1:8081/etl/hbase/mytest_person2.yml -X POST
+     *
+     * @param type   类型 hbase, es
+     * @param task   任务名对应配置文件名 mytest_person2.yml
      * @param params etl where条件参数, 为空全部导入
      */
     @PostMapping("/etl/{type}/{task}")
@@ -128,7 +191,7 @@ public class CommonRest {
      * 统计总数 curl http://127.0.0.1:8081/count/rdb/oracle1/mytest_user.yml
      *
      * @param type 类型 hbase, es
-     * @param key adapter key
+     * @param key  adapter key
      * @param task 任务名对应配置文件名 mytest_person2.yml
      * @return
      */
@@ -180,7 +243,7 @@ public class CommonRest {
      * 实例同步开关 curl http://127.0.0.1:8081/syncSwitch/example/off -X PUT
      *
      * @param destination 实例名称
-     * @param status 开关状态: off on
+     * @param status      开关状态: off on
      * @return
      */
     @PutMapping("/syncSwitch/{destination}/{status}")
