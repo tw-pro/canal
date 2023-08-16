@@ -103,6 +103,11 @@ public class CommonRest {
         }
     }
 
+    @GetMapping("/etl/sync/hello")
+    public String etlHello(){
+        return "hello world";
+    }
+
     /**
      * ETL curl http://127.0.0.1:8081/etl/es7/mytest_person2.yml/10000/300 -X POST
      *
@@ -111,10 +116,12 @@ public class CommonRest {
      * @param max  id的最大值
      * @param step 步长
      */
-    @PostMapping("/etl/sync/{type}/{task}")
-    public EtlResult etlSync(@PathVariable String type, @PathVariable String task,
-                             @RequestParam(name = "max") int max,
-                             @RequestParam(name = "step") int step) {
+    @PostMapping("/etl/sync/{type}/{task}/{min}/{max}/{step}")
+    public EtlResult etlSync(@PathVariable String type,
+                             @PathVariable String task,
+                             @PathVariable int min,
+                             @PathVariable int max,
+                             @PathVariable int step) {
         String key = FileName2KeyMapping.getKey(type, task);
         OuterAdapter adapter = loader.getExtension(type, key);
         String destination = adapter.getDestination(task);
@@ -144,9 +151,10 @@ public class CommonRest {
         try {
             logger.info("开始清洗数据,类型为{},task的任务为{}", type, task);
             // 循环放入id的区间
-            for (int i = 1; i < max; i += step) {
+            for (int i = min; i < max; i += step) {
                 // 组装id 的区间 格式为  1;300000
                 String params = i + ";" + (i - 1 + step);
+                logger.info("开始清洗id范围为{}的数据", params);
                 // 同步更新
                 List<String> paramArray = Arrays.asList(params.trim().split(";"));
                 adapter.etl(task, paramArray);
